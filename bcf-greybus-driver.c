@@ -13,3 +13,5 @@ module_init(bcf_greybus_init);
 module_exit(bcf_greybus_exit);
 
 MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Ayush Singh <ayushdevel1325@gmail.com>");
+MODULE_DESCRIPTION("A Greybus driver for BeaglePlay");
