@@ -1,0 +1,10 @@
+.*
+*.mod
+*.ko
+*.o
+*.mod.*
+*.ko.*
+*.o.*
+compile_commands.json
+modules.order
+Module.symvers
