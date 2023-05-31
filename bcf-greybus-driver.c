@@ -26,7 +26,20 @@ static struct serdev_device_ops bcf_greybus_ops = {
 
 struct bcf_greybus {
   struct serdev_device *serdev;
+
+  struct work_struct tx_work;
+  spinlock_t tx_producer_lock;
+  spinlock_t tx_consumer_lock;
 };
+
+static void bcf_greybus_uart_transmit(struct work_struct *work) {
+  struct bcf_greybus *bcf_greybus =
+      container_of(work, struct bcf_greybus, tx_work);
+
+  spin_lock_bh(&bcf_greybus->tx_consumer_lock);
+  dev_info(&bcf_greybus->serdev->dev, "Write to tx buffer");
+  spin_unlock_bh(&bcf_greybus->tx_consumer_lock);
+}
 
 static const struct of_device_id bcf_greybus_of_match[] = {
     {
@@ -44,6 +57,10 @@ static int bcf_greybus_probe(struct serdev_device *serdev) {
       devm_kmalloc(&serdev->dev, sizeof(struct bcf_greybus), GFP_KERNEL);
 
   bcf_greybus->serdev = serdev;
+
+  INIT_WORK(&bcf_greybus->tx_work, bcf_greybus_uart_transmit);
+  spin_lock_init(&bcf_greybus->tx_producer_lock);
+  spin_lock_init(&bcf_greybus->tx_consumer_lock);
 
   serdev_device_set_drvdata(serdev, bcf_greybus);
   serdev_device_set_client_ops(serdev, &bcf_greybus_ops);
@@ -67,8 +84,10 @@ static int bcf_greybus_probe(struct serdev_device *serdev) {
 
 static void bcf_greybus_remove(struct serdev_device *serdev) {
   struct bcf_greybus *bcf_greybus = serdev_device_get_drvdata(serdev);
-  dev_info(&bcf_greybus->serdev->dev, "Remove %s\n", BCF_GREYBUS_DRV_NAME);
 
+  dev_info(&bcf_greybus->serdev->dev, "Remove Driver\n");
+
+  flush_work(&bcf_greybus->tx_work);
   serdev_device_close(serdev);
 }
 
