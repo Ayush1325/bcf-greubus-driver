@@ -30,15 +30,20 @@ MODULE_DEVICE_TABLE(of, bcf_greybus_of_match);
 
 static int bcf_greybus_tty_receive(struct serdev_device *serdev,
                                    const unsigned char *data, size_t count) {
-  pr_info("BCF_GREYBUS tty recieve\n");
-  return 0;
+  struct bcf_greybus *bcf_greybus;
+
+  bcf_greybus = serdev_device_get_drvdata(serdev);
+  dev_info(&bcf_greybus->serdev->dev, "tty recieve\n");
+  dev_info(&bcf_greybus->serdev->dev, "Data: %s\n", data);
+
+  return count;
 }
 
 static void bcf_greybus_tty_wakeup(struct serdev_device *serdev) {
   struct bcf_greybus *bcf_greybus;
 
-  pr_info("BCF_GREYBUS tty wakeup\n");
   bcf_greybus = serdev_device_get_drvdata(serdev);
+  dev_info(&bcf_greybus->serdev->dev, "tty wakeup\n");
 
   schedule_work(&bcf_greybus->tx_work);
 }
@@ -79,6 +84,7 @@ static void bcf_greybus_serdev_write_locked(struct bcf_greybus *bcf_greybus) {
   if (count >= 1) {
     written = serdev_device_write_buf(
         bcf_greybus->serdev, &bcf_greybus->tx_circ_buf.buf[tail], count);
+    dev_info(&bcf_greybus->serdev->dev, "Written Data of Len: %u\n", written);
 
     smp_store_release(&(bcf_greybus->tx_circ_buf.tail),
                       (tail + written) & (TX_CIRC_BUF_SIZE - 1));
