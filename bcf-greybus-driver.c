@@ -104,7 +104,7 @@ static void bcf_greybus_uart_transmit(struct work_struct *work) {
 // A simple function to write "HelloWorld" over UART.
 // TODO: Remove in the future.
 static void hello_world(struct bcf_greybus *bcf_greybus) {
-  const char msg[] = "HelloWorld\0";
+  const char msg[] = "HelloWorld\n\0";
   const ssize_t msg_len = strlen(msg);
   ssize_t i;
 
@@ -151,8 +151,6 @@ static int bcf_greybus_probe(struct serdev_device *serdev) {
   dev_dbg(&bcf_greybus->serdev->dev, "Using baudrate %u\n", speed);
 
   serdev_device_set_flow_control(serdev, false);
-
-  hello_world(bcf_greybus);
 
   dev_info(&bcf_greybus->serdev->dev, "Successful Probe %s\n",
            BCF_GREYBUS_DRV_NAME);
