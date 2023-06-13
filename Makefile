@@ -1,4 +1,4 @@
-obj-m += bcf-greybus-driver.o
+obj-m += beagleplay-greybus-driver.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(CURDIR)
