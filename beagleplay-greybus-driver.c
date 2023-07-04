@@ -1,4 +1,5 @@
 #include <linux/circ_buf.h>
+#include <linux/crc-ccitt.h>
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -11,6 +12,16 @@
 #define BEAGLEPLAY_GREYBUS_DRV_NAME "bcfgreybus"
 #define TX_CIRC_BUF_SIZE 1024
 
+#define HDLC_FRAME 0x7E
+#define HDLC_ESC 0x7D
+#define HDLC_XOR 0x20
+
+#define ADDRESS_DBG 0x02
+
+#define MAX_RX_HDLC (1 + RX_HDLC_PAYLOAD + CRC_LEN)
+#define RX_HDLC_PAYLOAD 140
+#define CRC_LEN 2
+
 struct beagleplay_greybus {
   struct serdev_device *serdev;
 
@@ -18,6 +29,11 @@ struct beagleplay_greybus {
   spinlock_t tx_producer_lock;
   spinlock_t tx_consumer_lock;
   struct circ_buf tx_circ_buf;
+
+  u8 rx_address;
+  u8 *rx_buffer;
+  u16 rx_offset;
+  u8 rx_in_esc;
 };
 
 static const struct of_device_id beagleplay_greybus_of_match[] = {
@@ -32,10 +48,69 @@ static int beagleplay_greybus_tty_receive(struct serdev_device *serdev,
                                           const unsigned char *data,
                                           size_t count) {
   struct beagleplay_greybus *beagleplay_greybus;
+  u16 crc_check = 0;
+  size_t i;
+  u8 c;
 
   beagleplay_greybus = serdev_device_get_drvdata(serdev);
-  dev_info(&beagleplay_greybus->serdev->dev, "tty recieve\n");
-  dev_info(&beagleplay_greybus->serdev->dev, "Data: %s\n", data);
+
+  for (i = 0; i < count; ++i) {
+    c = data[i];
+    if (c == HDLC_FRAME) {
+      if (beagleplay_greybus->rx_address != 0xFF) {
+        crc_check = crc_ccitt(0xffff, &beagleplay_greybus->rx_address, 1);
+        crc_check = crc_ccitt(crc_check, beagleplay_greybus->rx_buffer,
+                              beagleplay_greybus->rx_offset);
+
+        if (crc_check == 0xf0b8) {
+          if ((beagleplay_greybus->rx_buffer[0] & 1) == 0) {
+            // I-Frame, send S-Frame ACK
+            // bcfserial_hdlc_send_ack(bcfserial, bcfserial->rx_address,
+            //                         (bcfserial->rx_buffer[0] >> 1) & 0x7);
+          }
+
+          if (beagleplay_greybus->rx_address == ADDRESS_DBG) {
+            beagleplay_greybus->rx_buffer[beagleplay_greybus->rx_offset - 2] =
+                0;
+            dev_info(&beagleplay_greybus->serdev->dev, "Frame Data: %s\n",
+                     beagleplay_greybus->rx_buffer + 1);
+          }
+        } else {
+          dev_err(&beagleplay_greybus->serdev->dev,
+                  "CRC Failed from %02x: 0x%04x\n",
+                  beagleplay_greybus->rx_address, crc_check);
+        }
+      }
+      beagleplay_greybus->rx_offset = 0;
+      beagleplay_greybus->rx_address = 0xFF;
+    } else if (c == HDLC_ESC) {
+      beagleplay_greybus->rx_in_esc = 1;
+    } else {
+      if (beagleplay_greybus->rx_in_esc) {
+        c ^= 0x20;
+        beagleplay_greybus->rx_in_esc = 0;
+      }
+
+      if (beagleplay_greybus->rx_address == 0xFF) {
+        beagleplay_greybus->rx_address = c;
+        if (beagleplay_greybus->rx_address == ADDRESS_DBG) {
+        } else {
+          beagleplay_greybus->rx_address = 0xFF;
+        }
+        beagleplay_greybus->rx_offset = 0;
+      } else {
+        if (beagleplay_greybus->rx_offset < MAX_RX_HDLC) {
+          beagleplay_greybus->rx_buffer[beagleplay_greybus->rx_offset] = c;
+          beagleplay_greybus->rx_offset++;
+        } else {
+          // buffer overflow
+          dev_err(&beagleplay_greybus->serdev->dev, "RX Buffer Overflow\n");
+          beagleplay_greybus->rx_address = 0xFF;
+          beagleplay_greybus->rx_offset = 0;
+        }
+      }
+    }
+  }
 
   return count;
 }
@@ -143,6 +218,12 @@ static int beagleplay_greybus_probe(struct serdev_device *serdev) {
   beagleplay_greybus->tx_circ_buf.tail = 0;
   beagleplay_greybus->tx_circ_buf.buf =
       devm_kmalloc(&serdev->dev, TX_CIRC_BUF_SIZE, GFP_KERNEL);
+
+  beagleplay_greybus->rx_buffer =
+      devm_kmalloc(&serdev->dev, MAX_RX_HDLC, GFP_KERNEL);
+  beagleplay_greybus->rx_offset = 0;
+  beagleplay_greybus->rx_address = 0xff;
+  beagleplay_greybus->rx_in_esc = 0;
 
   serdev_device_set_drvdata(serdev, beagleplay_greybus);
   serdev_device_set_client_ops(serdev, &beagleplay_greybus_ops);
