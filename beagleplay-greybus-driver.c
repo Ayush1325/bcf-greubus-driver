@@ -16,6 +16,7 @@
 #define HDLC_ESC 0x7D
 #define HDLC_XOR 0x20
 
+#define ADDRESS_GREYBUS 0x01
 #define ADDRESS_DBG 0x02
 
 #define MAX_RX_HDLC (1 + RX_HDLC_PAYLOAD + CRC_LEN)
@@ -29,6 +30,8 @@ struct beagleplay_greybus {
   spinlock_t tx_producer_lock;
   spinlock_t tx_consumer_lock;
   struct circ_buf tx_circ_buf;
+  u16 tx_crc;
+  u8 tx_ack_seq; /* current TX ACK sequence number */
 
   u8 rx_address;
   u8 *rx_buffer;
@@ -182,23 +185,80 @@ static void beagleplay_greybus_uart_transmit(struct work_struct *work) {
   spin_unlock_bh(&beagleplay_greybus->tx_consumer_lock);
 }
 
-// A simple function to write "HelloWorld" over UART.
-// TODO: Remove in the future.
-static void hello_world(struct beagleplay_greybus *beagleplay_greybus) {
-  const char msg[] = "HelloWorld\n\0";
-  const ssize_t msg_len = strlen(msg);
-  ssize_t i;
+static void
+bcfserial_append_tx_frame(struct beagleplay_greybus *beagleplay_greybus) {
+  beagleplay_greybus->tx_crc = 0xFFFF;
+  beagleplay_greybus_append(beagleplay_greybus, HDLC_FRAME);
+}
+
+static void
+beagleplay_greybus_append_tx_u8(struct beagleplay_greybus *beagleplay_greybus,
+                                u8 value) {
+  beagleplay_greybus->tx_crc = crc_ccitt(beagleplay_greybus->tx_crc, &value, 1);
+  beagleplay_greybus_append(beagleplay_greybus, value);
+}
+
+static void beagleplay_greybus_append_tx_buffer(
+    struct beagleplay_greybus *beagleplay_greybus, const void *buffer,
+    size_t len) {
+  size_t i;
+  for (i = 0; i < len; i++) {
+    beagleplay_greybus_append_tx_u8(beagleplay_greybus, ((u8 *)buffer)[i]);
+  }
+}
+
+static void
+beagleplay_greybus_append_escaped(struct beagleplay_greybus *beagleplay_greybus,
+                                  u8 value) {
+  if (value == HDLC_FRAME || value == HDLC_ESC) {
+    beagleplay_greybus_append(beagleplay_greybus, HDLC_ESC);
+    value ^= HDLC_XOR;
+  }
+  beagleplay_greybus_append(beagleplay_greybus, value);
+}
+
+static void
+beagleplay_append_tx_crc(struct beagleplay_greybus *beagleplay_greybus) {
+  beagleplay_greybus->tx_crc ^= 0xffff;
+  beagleplay_greybus_append_escaped(beagleplay_greybus,
+                                    beagleplay_greybus->tx_crc & 0xff);
+  beagleplay_greybus_append_escaped(beagleplay_greybus,
+                                    (beagleplay_greybus->tx_crc >> 8) & 0xff);
+}
+
+static void
+beagleplay_greybus_hdlc_send(struct beagleplay_greybus *beagleplay_greybus,
+                             u16 length, const void *buffer) {
+  // HDLC_FRAME
+  // 0 address : 0x01
+  // 1 control : 0x03
+  // contents
+  // x/y crc
+  // HDLC_FRAME
 
   spin_lock(&beagleplay_greybus->tx_producer_lock);
-  for (i = 0; i < msg_len; ++i) {
-    beagleplay_greybus_append(beagleplay_greybus, msg[i]);
-  }
+
+  bcfserial_append_tx_frame(beagleplay_greybus);
+  beagleplay_greybus_append_tx_u8(beagleplay_greybus, ADDRESS_GREYBUS); // address
+  beagleplay_greybus_append_tx_u8(beagleplay_greybus, 0x03); // control
+  beagleplay_greybus_append_tx_buffer(beagleplay_greybus, buffer, length);
+  beagleplay_append_tx_crc(beagleplay_greybus);
+  bcfserial_append_tx_frame(beagleplay_greybus);
+
   spin_unlock(&beagleplay_greybus->tx_producer_lock);
 
   spin_lock(&beagleplay_greybus->tx_consumer_lock);
   beagleplay_greybus_serdev_write_locked(beagleplay_greybus);
   spin_unlock(&beagleplay_greybus->tx_consumer_lock);
+}
 
+// A simple function to write "HelloWorld" over UART.
+// TODO: Remove in the future.
+static void hello_world(struct beagleplay_greybus *beagleplay_greybus) {
+  const char msg[] = "HelloWorld\0";
+  const size_t msg_len = strlen(msg);
+
+  beagleplay_greybus_hdlc_send(beagleplay_greybus, msg_len, msg);
   dev_info(&beagleplay_greybus->serdev->dev, "Written Hello World");
 };
 
@@ -240,6 +300,8 @@ static int beagleplay_greybus_probe(struct serdev_device *serdev) {
   serdev_device_set_flow_control(serdev, false);
 
   dev_info(&beagleplay_greybus->serdev->dev, "Successful Probe\n");
+
+  hello_world(beagleplay_greybus);
 
   return 0;
 }
