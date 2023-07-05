@@ -154,9 +154,7 @@ beagleplay_greybus_hdlc_send(struct beagleplay_greybus *beagleplay_greybus,
 
   spin_unlock(&beagleplay_greybus->tx_producer_lock);
 
-  spin_lock(&beagleplay_greybus->tx_consumer_lock);
-  beagleplay_greybus_serdev_write_locked(beagleplay_greybus);
-  spin_unlock(&beagleplay_greybus->tx_consumer_lock);
+  schedule_work(&beagleplay_greybus->tx_work);
 }
 
 static int beagleplay_greybus_tty_receive(struct serdev_device *serdev,
@@ -250,8 +248,8 @@ static void beagleplay_greybus_uart_transmit(struct work_struct *work) {
   struct beagleplay_greybus *beagleplay_greybus =
       container_of(work, struct beagleplay_greybus, tx_work);
 
-  spin_lock_bh(&beagleplay_greybus->tx_consumer_lock);
   dev_info(&beagleplay_greybus->serdev->dev, "Write to tx buffer");
+  spin_lock_bh(&beagleplay_greybus->tx_consumer_lock);
   beagleplay_greybus_serdev_write_locked(beagleplay_greybus);
   spin_unlock_bh(&beagleplay_greybus->tx_consumer_lock);
 }
@@ -259,7 +257,7 @@ static void beagleplay_greybus_uart_transmit(struct work_struct *work) {
 // A simple function to write "HelloWorld" over UART.
 // TODO: Remove in the future.
 static void hello_world(struct beagleplay_greybus *beagleplay_greybus) {
-  const char msg[] = "HelloWorld\0";
+  const char msg[] = "Hello From Linux\0";
   const size_t msg_len = strlen(msg);
 
   beagleplay_greybus_hdlc_send(beagleplay_greybus, msg_len, msg, ADDRESS_GREYBUS, 0x03);
