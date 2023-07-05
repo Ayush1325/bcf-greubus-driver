@@ -178,10 +178,9 @@ static int beagleplay_greybus_tty_receive(struct serdev_device *serdev,
         if (crc_check == 0xf0b8) {
           if ((beagleplay_greybus->rx_buffer[0] & 1) == 0) {
             // I-Frame, send S-Frame ACK
-            // bcfserial_hdlc_send_ack(beagleplay_greybus,
-            // beagleplay_greybus->rx_address,
-            //                         (beagleplay_greybus->rx_buffer[0] >> 1) &
-            //                         0x7);
+            beagleplay_greybus_hdlc_send(
+                beagleplay_greybus, 0, NULL, beagleplay_greybus->rx_address,
+                (beagleplay_greybus->rx_buffer[0] >> 1) & 0x7);
           }
 
           if (beagleplay_greybus->rx_address == ADDRESS_DBG) {
@@ -260,7 +259,8 @@ static void hello_world(struct beagleplay_greybus *beagleplay_greybus) {
   const char msg[] = "Hello From Linux\0";
   const size_t msg_len = strlen(msg);
 
-  beagleplay_greybus_hdlc_send(beagleplay_greybus, msg_len, msg, ADDRESS_GREYBUS, 0x03);
+  beagleplay_greybus_hdlc_send(beagleplay_greybus, msg_len, msg,
+                               ADDRESS_GREYBUS, 0x03);
   dev_info(&beagleplay_greybus->serdev->dev, "Written Hello World");
 };
 
