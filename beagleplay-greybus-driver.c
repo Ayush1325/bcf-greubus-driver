@@ -47,6 +47,118 @@ static const struct of_device_id beagleplay_greybus_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, beagleplay_greybus_of_match);
 
+static void
+beagleplay_greybus_append(struct beagleplay_greybus *beagleplay_greybus,
+                          u8 value) {
+  // must be locked already
+  int head = beagleplay_greybus->tx_circ_buf.head;
+
+  while (true) {
+    int tail = READ_ONCE(beagleplay_greybus->tx_circ_buf.tail);
+
+    if (CIRC_SPACE(head, tail, TX_CIRC_BUF_SIZE) >= 1) {
+
+      beagleplay_greybus->tx_circ_buf.buf[head] = value;
+
+      smp_store_release(&(beagleplay_greybus->tx_circ_buf.head),
+                        (head + 1) & (TX_CIRC_BUF_SIZE - 1));
+      return;
+    } else {
+      dev_dbg(&beagleplay_greybus->serdev->dev, "Tx circ buf full\n");
+      usleep_range(3000, 5000);
+    }
+  }
+}
+
+static void
+bcfserial_append_tx_frame(struct beagleplay_greybus *beagleplay_greybus) {
+  beagleplay_greybus->tx_crc = 0xFFFF;
+  beagleplay_greybus_append(beagleplay_greybus, HDLC_FRAME);
+}
+
+static void
+beagleplay_greybus_append_tx_u8(struct beagleplay_greybus *beagleplay_greybus,
+                                u8 value) {
+  beagleplay_greybus->tx_crc = crc_ccitt(beagleplay_greybus->tx_crc, &value, 1);
+  beagleplay_greybus_append(beagleplay_greybus, value);
+}
+
+static void beagleplay_greybus_append_tx_buffer(
+    struct beagleplay_greybus *beagleplay_greybus, const void *buffer,
+    size_t len) {
+  size_t i;
+  for (i = 0; i < len; i++) {
+    beagleplay_greybus_append_tx_u8(beagleplay_greybus, ((u8 *)buffer)[i]);
+  }
+}
+
+static void
+beagleplay_greybus_append_escaped(struct beagleplay_greybus *beagleplay_greybus,
+                                  u8 value) {
+  if (value == HDLC_FRAME || value == HDLC_ESC) {
+    beagleplay_greybus_append(beagleplay_greybus, HDLC_ESC);
+    value ^= HDLC_XOR;
+  }
+  beagleplay_greybus_append(beagleplay_greybus, value);
+}
+
+static void
+beagleplay_append_tx_crc(struct beagleplay_greybus *beagleplay_greybus) {
+  beagleplay_greybus->tx_crc ^= 0xffff;
+  beagleplay_greybus_append_escaped(beagleplay_greybus,
+                                    beagleplay_greybus->tx_crc & 0xff);
+  beagleplay_greybus_append_escaped(beagleplay_greybus,
+                                    (beagleplay_greybus->tx_crc >> 8) & 0xff);
+}
+
+static void beagleplay_greybus_serdev_write_locked(
+    struct beagleplay_greybus *beagleplay_greybus) {
+  // must be locked already
+  int head = smp_load_acquire(&beagleplay_greybus->tx_circ_buf.head);
+  int tail = beagleplay_greybus->tx_circ_buf.tail;
+  int count = CIRC_CNT_TO_END(head, tail, TX_CIRC_BUF_SIZE);
+  int written;
+
+  if (count >= 1) {
+    written = serdev_device_write_buf(
+        beagleplay_greybus->serdev, &beagleplay_greybus->tx_circ_buf.buf[tail],
+        count);
+    dev_info(&beagleplay_greybus->serdev->dev, "Written Data of Len: %u\n",
+             written);
+
+    smp_store_release(&(beagleplay_greybus->tx_circ_buf.tail),
+                      (tail + written) & (TX_CIRC_BUF_SIZE - 1));
+  }
+}
+
+static void
+beagleplay_greybus_hdlc_send(struct beagleplay_greybus *beagleplay_greybus,
+                             u16 length, const void *buffer, u8 address,
+                             u8 control) {
+  // HDLC_FRAME
+  // 0 address : 0x01
+  // 1 control : 0x03
+  // contents
+  // x/y crc
+  // HDLC_FRAME
+
+  spin_lock(&beagleplay_greybus->tx_producer_lock);
+
+  bcfserial_append_tx_frame(beagleplay_greybus);
+  beagleplay_greybus_append_tx_u8(beagleplay_greybus,
+                                  address);                     // address
+  beagleplay_greybus_append_tx_u8(beagleplay_greybus, control); // control
+  beagleplay_greybus_append_tx_buffer(beagleplay_greybus, buffer, length);
+  beagleplay_append_tx_crc(beagleplay_greybus);
+  bcfserial_append_tx_frame(beagleplay_greybus);
+
+  spin_unlock(&beagleplay_greybus->tx_producer_lock);
+
+  spin_lock(&beagleplay_greybus->tx_consumer_lock);
+  beagleplay_greybus_serdev_write_locked(beagleplay_greybus);
+  spin_unlock(&beagleplay_greybus->tx_consumer_lock);
+}
+
 static int beagleplay_greybus_tty_receive(struct serdev_device *serdev,
                                           const unsigned char *data,
                                           size_t count) {
@@ -68,8 +180,10 @@ static int beagleplay_greybus_tty_receive(struct serdev_device *serdev,
         if (crc_check == 0xf0b8) {
           if ((beagleplay_greybus->rx_buffer[0] & 1) == 0) {
             // I-Frame, send S-Frame ACK
-            // bcfserial_hdlc_send_ack(bcfserial, bcfserial->rx_address,
-            //                         (bcfserial->rx_buffer[0] >> 1) & 0x7);
+            // bcfserial_hdlc_send_ack(beagleplay_greybus,
+            // beagleplay_greybus->rx_address,
+            //                         (beagleplay_greybus->rx_buffer[0] >> 1) &
+            //                         0x7);
           }
 
           if (beagleplay_greybus->rx_address == ADDRESS_DBG) {
@@ -132,49 +246,6 @@ static struct serdev_device_ops beagleplay_greybus_ops = {
     .write_wakeup = beagleplay_greybus_tty_wakeup,
 };
 
-static void
-beagleplay_greybus_append(struct beagleplay_greybus *beagleplay_greybus,
-                          u8 value) {
-  // must be locked already
-  int head = beagleplay_greybus->tx_circ_buf.head;
-
-  while (true) {
-    int tail = READ_ONCE(beagleplay_greybus->tx_circ_buf.tail);
-
-    if (CIRC_SPACE(head, tail, TX_CIRC_BUF_SIZE) >= 1) {
-
-      beagleplay_greybus->tx_circ_buf.buf[head] = value;
-
-      smp_store_release(&(beagleplay_greybus->tx_circ_buf.head),
-                        (head + 1) & (TX_CIRC_BUF_SIZE - 1));
-      return;
-    } else {
-      dev_dbg(&beagleplay_greybus->serdev->dev, "Tx circ buf full\n");
-      usleep_range(3000, 5000);
-    }
-  }
-}
-
-static void beagleplay_greybus_serdev_write_locked(
-    struct beagleplay_greybus *beagleplay_greybus) {
-  // must be locked already
-  int head = smp_load_acquire(&beagleplay_greybus->tx_circ_buf.head);
-  int tail = beagleplay_greybus->tx_circ_buf.tail;
-  int count = CIRC_CNT_TO_END(head, tail, TX_CIRC_BUF_SIZE);
-  int written;
-
-  if (count >= 1) {
-    written = serdev_device_write_buf(
-        beagleplay_greybus->serdev, &beagleplay_greybus->tx_circ_buf.buf[tail],
-        count);
-    dev_info(&beagleplay_greybus->serdev->dev, "Written Data of Len: %u\n",
-             written);
-
-    smp_store_release(&(beagleplay_greybus->tx_circ_buf.tail),
-                      (tail + written) & (TX_CIRC_BUF_SIZE - 1));
-  }
-}
-
 static void beagleplay_greybus_uart_transmit(struct work_struct *work) {
   struct beagleplay_greybus *beagleplay_greybus =
       container_of(work, struct beagleplay_greybus, tx_work);
@@ -185,80 +256,13 @@ static void beagleplay_greybus_uart_transmit(struct work_struct *work) {
   spin_unlock_bh(&beagleplay_greybus->tx_consumer_lock);
 }
 
-static void
-bcfserial_append_tx_frame(struct beagleplay_greybus *beagleplay_greybus) {
-  beagleplay_greybus->tx_crc = 0xFFFF;
-  beagleplay_greybus_append(beagleplay_greybus, HDLC_FRAME);
-}
-
-static void
-beagleplay_greybus_append_tx_u8(struct beagleplay_greybus *beagleplay_greybus,
-                                u8 value) {
-  beagleplay_greybus->tx_crc = crc_ccitt(beagleplay_greybus->tx_crc, &value, 1);
-  beagleplay_greybus_append(beagleplay_greybus, value);
-}
-
-static void beagleplay_greybus_append_tx_buffer(
-    struct beagleplay_greybus *beagleplay_greybus, const void *buffer,
-    size_t len) {
-  size_t i;
-  for (i = 0; i < len; i++) {
-    beagleplay_greybus_append_tx_u8(beagleplay_greybus, ((u8 *)buffer)[i]);
-  }
-}
-
-static void
-beagleplay_greybus_append_escaped(struct beagleplay_greybus *beagleplay_greybus,
-                                  u8 value) {
-  if (value == HDLC_FRAME || value == HDLC_ESC) {
-    beagleplay_greybus_append(beagleplay_greybus, HDLC_ESC);
-    value ^= HDLC_XOR;
-  }
-  beagleplay_greybus_append(beagleplay_greybus, value);
-}
-
-static void
-beagleplay_append_tx_crc(struct beagleplay_greybus *beagleplay_greybus) {
-  beagleplay_greybus->tx_crc ^= 0xffff;
-  beagleplay_greybus_append_escaped(beagleplay_greybus,
-                                    beagleplay_greybus->tx_crc & 0xff);
-  beagleplay_greybus_append_escaped(beagleplay_greybus,
-                                    (beagleplay_greybus->tx_crc >> 8) & 0xff);
-}
-
-static void
-beagleplay_greybus_hdlc_send(struct beagleplay_greybus *beagleplay_greybus,
-                             u16 length, const void *buffer) {
-  // HDLC_FRAME
-  // 0 address : 0x01
-  // 1 control : 0x03
-  // contents
-  // x/y crc
-  // HDLC_FRAME
-
-  spin_lock(&beagleplay_greybus->tx_producer_lock);
-
-  bcfserial_append_tx_frame(beagleplay_greybus);
-  beagleplay_greybus_append_tx_u8(beagleplay_greybus, ADDRESS_GREYBUS); // address
-  beagleplay_greybus_append_tx_u8(beagleplay_greybus, 0x03); // control
-  beagleplay_greybus_append_tx_buffer(beagleplay_greybus, buffer, length);
-  beagleplay_append_tx_crc(beagleplay_greybus);
-  bcfserial_append_tx_frame(beagleplay_greybus);
-
-  spin_unlock(&beagleplay_greybus->tx_producer_lock);
-
-  spin_lock(&beagleplay_greybus->tx_consumer_lock);
-  beagleplay_greybus_serdev_write_locked(beagleplay_greybus);
-  spin_unlock(&beagleplay_greybus->tx_consumer_lock);
-}
-
 // A simple function to write "HelloWorld" over UART.
 // TODO: Remove in the future.
 static void hello_world(struct beagleplay_greybus *beagleplay_greybus) {
   const char msg[] = "HelloWorld\0";
   const size_t msg_len = strlen(msg);
 
-  beagleplay_greybus_hdlc_send(beagleplay_greybus, msg_len, msg);
+  beagleplay_greybus_hdlc_send(beagleplay_greybus, msg_len, msg, ADDRESS_GREYBUS, 0x03);
   dev_info(&beagleplay_greybus->serdev->dev, "Written Hello World");
 };
 
