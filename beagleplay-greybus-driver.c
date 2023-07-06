@@ -1,9 +1,11 @@
 #include "beagleplay-greybus-driver.h"
+#include <linux/tty_driver.h>
 #include <linux/crc-ccitt.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/printk.h>
 #include <linux/serdev.h>
+#include <linux/tty.h>
 
 #define DEBUG
 
@@ -247,6 +249,37 @@ static void hello_world(struct beagleplay_greybus *beagleplay_greybus) {
   dev_info(&beagleplay_greybus->serdev->dev, "Written Hello World");
 };
 
+static int mcutty_open(struct tty_struct *tty, struct file *file) {
+  dev_info(tty->dev, "MCUTTY Open Called");
+  return 0;
+}
+
+static void mcutty_close(struct tty_struct *tty, struct file *file) {
+  dev_info(tty->dev, "MCUTTY Close Called");
+}
+
+static int mcutty_write(struct tty_struct *tty, const unsigned char *buf, int count) {
+  dev_info(tty->dev, "MCUTTY Write Called with %s", buf);
+  return count;
+}
+
+static int mcutty_write_room(struct tty_struct *tty) {
+  dev_info(tty->dev, "MCUTTY Write Room Called");
+  return 0;
+}
+
+static void mcutty_set_termios(struct tty_struct *tty, struct ktermios *old) {
+  dev_info(tty->dev, "MCUTTY Set Termios Called");
+}
+
+static struct tty_operations mcu_ops = {
+  .open = mcutty_open,
+  .close = mcutty_close,
+  .write = mcutty_write,
+  .write_room = mcutty_write_room,
+  .set_termios = mcutty_set_termios
+};
+
 static int beagleplay_greybus_probe(struct serdev_device *serdev) {
   u32 speed = 115200;
   int ret = 0;
@@ -284,6 +317,21 @@ static int beagleplay_greybus_probe(struct serdev_device *serdev) {
 
   serdev_device_set_flow_control(serdev, false);
 
+  // Init MCUmgr TTY
+  beagleplay_greybus->mcumgr_tty = tty_alloc_driver(1, 0);
+  if (beagleplay_greybus->mcumgr_tty == NULL) {
+    dev_err(&beagleplay_greybus->serdev->dev, "Unable to allocate MCUmgr TTY");
+    return -ENOMEM;
+  }
+  beagleplay_greybus->mcumgr_tty->driver_name = "cc1352_mcumgr_tty";
+  beagleplay_greybus->mcumgr_tty->name = "mcutty";
+  tty_set_operations(beagleplay_greybus->mcumgr_tty, &mcu_ops);
+  ret = tty_register_driver(beagleplay_greybus->mcumgr_tty);
+  if (ret) {
+    dev_err(&beagleplay_greybus->serdev->dev, "Unable to register TTY driver");
+    return ret;
+  }
+
   dev_info(&beagleplay_greybus->serdev->dev, "Successful Probe\n");
 
   hello_world(beagleplay_greybus);
@@ -296,6 +344,9 @@ static void beagleplay_greybus_remove(struct serdev_device *serdev) {
       serdev_device_get_drvdata(serdev);
 
   dev_info(&beagleplay_greybus->serdev->dev, "Remove Driver\n");
+
+  tty_unregister_device(beagleplay_greybus->mcumgr_tty, 0);
+  tty_unregister_driver(beagleplay_greybus->mcumgr_tty);
 
   flush_work(&beagleplay_greybus->tx_work);
   serdev_device_close(serdev);
