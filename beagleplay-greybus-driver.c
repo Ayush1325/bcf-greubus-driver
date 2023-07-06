@@ -1,6 +1,5 @@
-#include <linux/circ_buf.h>
+#include "beagleplay-greybus-driver.h"
 #include <linux/crc-ccitt.h>
-#include <linux/init.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/printk.h>
@@ -22,22 +21,6 @@
 #define MAX_RX_HDLC (1 + RX_HDLC_PAYLOAD + CRC_LEN)
 #define RX_HDLC_PAYLOAD 140
 #define CRC_LEN 2
-
-struct beagleplay_greybus {
-  struct serdev_device *serdev;
-
-  struct work_struct tx_work;
-  spinlock_t tx_producer_lock;
-  spinlock_t tx_consumer_lock;
-  struct circ_buf tx_circ_buf;
-  u16 tx_crc;
-  u8 tx_ack_seq; /* current TX ACK sequence number */
-
-  u8 rx_address;
-  u8 *rx_buffer;
-  u16 rx_offset;
-  u8 rx_in_esc;
-};
 
 static const struct of_device_id beagleplay_greybus_of_match[] = {
     {
