@@ -1,4 +1,5 @@
 #include "beagleplay-greybus-driver.h"
+#include <linux/device.h>
 #include <linux/tty_driver.h>
 #include <linux/crc-ccitt.h>
 #include <linux/module.h>
@@ -19,6 +20,7 @@
 
 #define ADDRESS_GREYBUS 0x01
 #define ADDRESS_DBG 0x02
+#define ADDRESS_MCUMGR 0x03
 
 #define MAX_RX_HDLC (1 + RX_HDLC_PAYLOAD + CRC_LEN)
 #define RX_HDLC_PAYLOAD 140
@@ -171,7 +173,7 @@ static int beagleplay_greybus_tty_receive(struct serdev_device *serdev,
           if (beagleplay_greybus->rx_address == ADDRESS_DBG) {
             beagleplay_greybus->rx_buffer[beagleplay_greybus->rx_offset - 2] =
                 0;
-            dev_dbg(&beagleplay_greybus->serdev->dev, "Frame Data: %s\n",
+            dev_info(&beagleplay_greybus->serdev->dev, "Frame Data: %s\n",
                      beagleplay_greybus->rx_buffer + 1);
           }
         } else {
@@ -259,13 +261,22 @@ static void mcutty_close(struct tty_struct *tty, struct file *file) {
 }
 
 static int mcutty_write(struct tty_struct *tty, const unsigned char *buf, int count) {
-  dev_info(tty->dev, "MCUTTY Write Called with %s", buf);
-  return count;
+  u16 write_len;
+  struct beagleplay_greybus *beagleplay_greybus = dev_get_drvdata(tty->dev);
+
+  dev_info(tty->dev, "MCUTTY Write Called with len %d", count);
+  if (count > U16_MAX) {
+    write_len = U16_MAX;
+  } else {
+    write_len = count;
+  }
+  beagleplay_greybus_hdlc_send(beagleplay_greybus, write_len, buf, ADDRESS_MCUMGR, 0x03);
+  return write_len;
 }
 
 static int mcutty_write_room(struct tty_struct *tty) {
   dev_info(tty->dev, "MCUTTY Write Room Called");
-  return 0;
+  return U16_MAX;
 }
 
 static void mcutty_set_termios(struct tty_struct *tty, struct ktermios *old) {
@@ -281,6 +292,7 @@ static struct tty_operations mcu_ops = {
 };
 
 static int beagleplay_greybus_probe(struct serdev_device *serdev) {
+  struct device *tty_dev;
   u32 speed = 115200;
   int ret = 0;
 
@@ -331,7 +343,6 @@ static int beagleplay_greybus_probe(struct serdev_device *serdev) {
   tty_port_init(beagleplay_greybus->mcumgr_tty_port);
   beagleplay_greybus->mcumgr_tty->driver_name = "cc1352_mcumgr_tty";
   beagleplay_greybus->mcumgr_tty->name = "ttyMCU";
-  beagleplay_greybus->mcumgr_tty->driver_state = beagleplay_greybus;
   beagleplay_greybus->mcumgr_tty->type = TTY_DRIVER_TYPE_SERIAL;
   tty_set_operations(beagleplay_greybus->mcumgr_tty, &mcu_ops);
   ret = tty_register_driver(beagleplay_greybus->mcumgr_tty);
@@ -339,8 +350,8 @@ static int beagleplay_greybus_probe(struct serdev_device *serdev) {
     dev_err(&beagleplay_greybus->serdev->dev, "Unable to register TTY driver");
     return ret;
   }
-
-  tty_port_register_device(beagleplay_greybus->mcumgr_tty_port, beagleplay_greybus->mcumgr_tty, 0, &serdev->dev);
+  tty_dev = tty_port_register_device(beagleplay_greybus->mcumgr_tty_port, beagleplay_greybus->mcumgr_tty, 0, &serdev->dev);
+  dev_set_drvdata(tty_dev, beagleplay_greybus);
 
   dev_info(&beagleplay_greybus->serdev->dev, "Successful Probe\n");
 
