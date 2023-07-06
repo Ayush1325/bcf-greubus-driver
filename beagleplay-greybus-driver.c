@@ -171,7 +171,7 @@ static int beagleplay_greybus_tty_receive(struct serdev_device *serdev,
           if (beagleplay_greybus->rx_address == ADDRESS_DBG) {
             beagleplay_greybus->rx_buffer[beagleplay_greybus->rx_offset - 2] =
                 0;
-            dev_info(&beagleplay_greybus->serdev->dev, "Frame Data: %s\n",
+            dev_dbg(&beagleplay_greybus->serdev->dev, "Frame Data: %s\n",
                      beagleplay_greybus->rx_buffer + 1);
           }
         } else {
@@ -318,19 +318,29 @@ static int beagleplay_greybus_probe(struct serdev_device *serdev) {
   serdev_device_set_flow_control(serdev, false);
 
   // Init MCUmgr TTY
-  beagleplay_greybus->mcumgr_tty = tty_alloc_driver(1, 0);
+  beagleplay_greybus->mcumgr_tty = tty_alloc_driver(1, TTY_DRIVER_DYNAMIC_DEV | TTY_DRIVER_REAL_RAW);
   if (beagleplay_greybus->mcumgr_tty == NULL) {
     dev_err(&beagleplay_greybus->serdev->dev, "Unable to allocate MCUmgr TTY");
     return -ENOMEM;
   }
+  beagleplay_greybus->mcumgr_tty_port = devm_kmalloc(&serdev->dev, sizeof(struct tty_port), GFP_KERNEL);
+  if (beagleplay_greybus->mcumgr_tty_port == NULL) {
+    dev_err(&beagleplay_greybus->serdev->dev, "Unable to allocate MCUmgr TTY Port");
+    return -ENOMEM;
+  }
+  tty_port_init(beagleplay_greybus->mcumgr_tty_port);
   beagleplay_greybus->mcumgr_tty->driver_name = "cc1352_mcumgr_tty";
-  beagleplay_greybus->mcumgr_tty->name = "mcutty";
+  beagleplay_greybus->mcumgr_tty->name = "ttyMCU";
+  beagleplay_greybus->mcumgr_tty->driver_state = beagleplay_greybus;
+  beagleplay_greybus->mcumgr_tty->type = TTY_DRIVER_TYPE_SERIAL;
   tty_set_operations(beagleplay_greybus->mcumgr_tty, &mcu_ops);
   ret = tty_register_driver(beagleplay_greybus->mcumgr_tty);
   if (ret) {
     dev_err(&beagleplay_greybus->serdev->dev, "Unable to register TTY driver");
     return ret;
   }
+
+  tty_port_register_device(beagleplay_greybus->mcumgr_tty_port, beagleplay_greybus->mcumgr_tty, 0, &serdev->dev);
 
   dev_info(&beagleplay_greybus->serdev->dev, "Successful Probe\n");
 
@@ -345,8 +355,11 @@ static void beagleplay_greybus_remove(struct serdev_device *serdev) {
 
   dev_info(&beagleplay_greybus->serdev->dev, "Remove Driver\n");
 
+  // Free tty stuff
   tty_unregister_device(beagleplay_greybus->mcumgr_tty, 0);
   tty_unregister_driver(beagleplay_greybus->mcumgr_tty);
+  tty_driver_kref_put(beagleplay_greybus->mcumgr_tty);
+  tty_port_destroy(beagleplay_greybus->mcumgr_tty_port);
 
   flush_work(&beagleplay_greybus->tx_work);
   serdev_device_close(serdev);

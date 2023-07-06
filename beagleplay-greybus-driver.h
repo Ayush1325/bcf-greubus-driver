@@ -9,6 +9,7 @@ struct beagleplay_greybus {
   struct serdev_device *serdev;
 
   struct tty_driver *mcumgr_tty;
+  struct tty_port *mcumgr_tty_port;
 
   struct work_struct tx_work;
   spinlock_t tx_producer_lock;
