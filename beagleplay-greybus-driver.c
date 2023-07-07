@@ -1,12 +1,13 @@
 #include "beagleplay-greybus-driver.h"
-#include <linux/device.h>
-#include <linux/tty_driver.h>
 #include <linux/crc-ccitt.h>
+#include <linux/device.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/printk.h>
 #include <linux/serdev.h>
 #include <linux/tty.h>
+#include <linux/tty_driver.h>
+#include <linux/tty_flip.h>
 
 #define DEBUG
 
@@ -144,6 +145,26 @@ beagleplay_greybus_hdlc_send(struct beagleplay_greybus *beagleplay_greybus,
   schedule_work(&beagleplay_greybus->tx_work);
 }
 
+static void beagleplay_greybus_handle_hdlc_rx_frame(
+    struct beagleplay_greybus *beagleplay_greybus) {
+  char buf[RX_HDLC_PAYLOAD];
+  memcpy(buf, &beagleplay_greybus->rx_buffer[1],
+         beagleplay_greybus->rx_offset - 3);
+  buf[beagleplay_greybus->rx_offset - 3] = 0;
+
+  switch (beagleplay_greybus->rx_address) {
+  case ADDRESS_DBG:
+    dev_info(&beagleplay_greybus->serdev->dev, "DBG Frame: %s", buf);
+    break;
+  case ADDRESS_MCUMGR:
+    dev_info(&beagleplay_greybus->serdev->dev, "Got MCUmgr frame");
+    break;
+  default:
+    dev_info(&beagleplay_greybus->serdev->dev, "Got Unkown Frame %u",
+             beagleplay_greybus->rx_address);
+  }
+}
+
 static int beagleplay_greybus_tty_receive(struct serdev_device *serdev,
                                           const unsigned char *data,
                                           size_t count) {
@@ -170,12 +191,7 @@ static int beagleplay_greybus_tty_receive(struct serdev_device *serdev,
                 (beagleplay_greybus->rx_buffer[0] >> 1) & 0x7);
           }
 
-          if (beagleplay_greybus->rx_address == ADDRESS_DBG) {
-            beagleplay_greybus->rx_buffer[beagleplay_greybus->rx_offset - 2] =
-                0;
-            dev_info(&beagleplay_greybus->serdev->dev, "Frame Data: %s\n",
-                     beagleplay_greybus->rx_buffer + 1);
-          }
+          beagleplay_greybus_handle_hdlc_rx_frame(beagleplay_greybus);
         } else {
           dev_err(&beagleplay_greybus->serdev->dev,
                   "CRC Failed from %02x: 0x%04x\n",
@@ -260,7 +276,8 @@ static void mcutty_close(struct tty_struct *tty, struct file *file) {
   dev_info(tty->dev, "MCUTTY Close Called");
 }
 
-static int mcutty_write(struct tty_struct *tty, const unsigned char *buf, int count) {
+static int mcutty_write(struct tty_struct *tty, const unsigned char *buf,
+                        int count) {
   u16 write_len;
   struct beagleplay_greybus *beagleplay_greybus = dev_get_drvdata(tty->dev);
 
@@ -270,7 +287,9 @@ static int mcutty_write(struct tty_struct *tty, const unsigned char *buf, int co
   } else {
     write_len = count;
   }
-  beagleplay_greybus_hdlc_send(beagleplay_greybus, write_len, buf, ADDRESS_MCUMGR, 0x03);
+  beagleplay_greybus_hdlc_send(beagleplay_greybus, write_len, buf,
+                               ADDRESS_MCUMGR, 0x03);
+
   return write_len;
 }
 
@@ -283,13 +302,11 @@ static void mcutty_set_termios(struct tty_struct *tty, struct ktermios *old) {
   dev_info(tty->dev, "MCUTTY Set Termios Called");
 }
 
-static struct tty_operations mcu_ops = {
-  .open = mcutty_open,
-  .close = mcutty_close,
-  .write = mcutty_write,
-  .write_room = mcutty_write_room,
-  .set_termios = mcutty_set_termios
-};
+static struct tty_operations mcu_ops = {.open = mcutty_open,
+                                        .close = mcutty_close,
+                                        .write = mcutty_write,
+                                        .write_room = mcutty_write_room,
+                                        .set_termios = mcutty_set_termios};
 
 static int beagleplay_greybus_probe(struct serdev_device *serdev) {
   struct device *tty_dev;
@@ -330,14 +347,17 @@ static int beagleplay_greybus_probe(struct serdev_device *serdev) {
   serdev_device_set_flow_control(serdev, false);
 
   // Init MCUmgr TTY
-  beagleplay_greybus->mcumgr_tty = tty_alloc_driver(1, TTY_DRIVER_DYNAMIC_DEV | TTY_DRIVER_REAL_RAW);
+  beagleplay_greybus->mcumgr_tty =
+      tty_alloc_driver(1, TTY_DRIVER_DYNAMIC_DEV | TTY_DRIVER_REAL_RAW);
   if (beagleplay_greybus->mcumgr_tty == NULL) {
     dev_err(&beagleplay_greybus->serdev->dev, "Unable to allocate MCUmgr TTY");
     return -ENOMEM;
   }
-  beagleplay_greybus->mcumgr_tty_port = devm_kmalloc(&serdev->dev, sizeof(struct tty_port), GFP_KERNEL);
+  beagleplay_greybus->mcumgr_tty_port =
+      devm_kmalloc(&serdev->dev, sizeof(struct tty_port), GFP_KERNEL);
   if (beagleplay_greybus->mcumgr_tty_port == NULL) {
-    dev_err(&beagleplay_greybus->serdev->dev, "Unable to allocate MCUmgr TTY Port");
+    dev_err(&beagleplay_greybus->serdev->dev,
+            "Unable to allocate MCUmgr TTY Port");
     return -ENOMEM;
   }
   tty_port_init(beagleplay_greybus->mcumgr_tty_port);
@@ -350,7 +370,9 @@ static int beagleplay_greybus_probe(struct serdev_device *serdev) {
     dev_err(&beagleplay_greybus->serdev->dev, "Unable to register TTY driver");
     return ret;
   }
-  tty_dev = tty_port_register_device(beagleplay_greybus->mcumgr_tty_port, beagleplay_greybus->mcumgr_tty, 0, &serdev->dev);
+  tty_dev =
+      tty_port_register_device(beagleplay_greybus->mcumgr_tty_port,
+                               beagleplay_greybus->mcumgr_tty, 0, &serdev->dev);
   dev_set_drvdata(tty_dev, beagleplay_greybus);
 
   dev_info(&beagleplay_greybus->serdev->dev, "Successful Probe\n");
